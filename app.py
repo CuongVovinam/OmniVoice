@@ -1,13 +1,15 @@
-#!/usr/bin/env python3
 import os
+import time
 import torch
-import gradio as gr
-import numpy as np
+import argparse
+import logging
 import zipfile
 import tempfile
 import shutil
-import logging
-from typing import List, Optional, Tuple, Dict, Any
+import numpy as np
+import gradio as gr
+from scipy.io import wavfile
+from typing import List, Optional, Tuple, Dict, Any, Union
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.lang_map import lang_display_name
 
@@ -21,13 +23,21 @@ def load_model(checkpoint="k2-fsa/OmniVoice"):
     global model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info(f"Loading model from {checkpoint} on {device}...")
+    
+    # Optimization: Set load_asr=False to save ~1GB VRAM since user always provides ref_text
     model = OmniVoice.from_pretrained(
         checkpoint,
         device_map=device,
         dtype=torch.float16 if device == "cuda" else torch.float32,
-        load_asr=True
+        load_asr=False 
     )
-    logging.info("Model loaded successfully.")
+    model.eval()
+    
+    # Performance tip: Ensure model is ready for SDPA
+    if hasattr(model, "to"):
+        model.to(device)
+        
+    logging.info("Model loaded successfully (ASR disabled to optimize VRAM).")
     return model
 
 # ---------------------------------------------------------------------------
@@ -90,62 +100,59 @@ def generate_audio(
     if mode == "clone":
         if not ref_audio:
             raise ValueError("Reference audio is required for Voice Clone.")
-        kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-            ref_audio=ref_audio,
-            ref_text=ref_text if ref_text else None,
-        )
+        if not ref_text:
+            raise ValueError("Reference Text is REQUIRED because ASR is disabled for performance.")
+        
+        with torch.inference_mode():
+            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+            )
 
     if instruct:
         kw["instruct"] = instruct
 
-    audio = model.generate(**kw)
+    with torch.inference_mode():
+        audio = model.generate(**kw)
+        
     sampling_rate = model.sampling_rate
     waveform = (audio[0] * 32767).astype(np.int16)
     return sampling_rate, waveform
 
 import scipy.io.wavfile as wavfile
 
-def process(
-    input_mode: str,
-    single_text: str,
-    batch_files: Optional[List[Any]],
-    language: str,
-    num_step: int,
-    guidance_scale: float,
-    denoise: bool,
-    speed: float,
-    duration: Optional[float],
-    preprocess_prompt: bool,
-    postprocess_output: bool,
-    mode: str,
-    ref_audio: Optional[str] = None,
-    ref_text: Optional[str] = None,
-    *design_args
-):
+def process(input_mode, single_text, batch_files, language, num_step, guidance_scale, denoise, speed, duration, preprocess_prompt, postprocess_output, mode, ref_audio, ref_text, *design_args, progress=gr.Progress()):
     if model is None:
         return None, None, "Model not loaded."
 
     instruct = None
     if mode == "design":
-        # Build instruct from design_args
         selected = [arg for arg in design_args if arg and arg != "Auto"]
         if selected:
             instruct = ", ".join(selected)
+
+    start_total = time.time()
+    total_chars = 0
 
     try:
         if input_mode == "Single Text":
             if not single_text.strip():
                 return None, None, "Please enter text."
             
+            progress(0, desc="Generating audio...")
+            total_chars = len(single_text)
+            
             sr, waveform = generate_audio(
                 single_text, language, num_step, guidance_scale, denoise, speed, 
                 duration, preprocess_prompt, postprocess_output, mode, ref_audio, ref_text, instruct
             )
             
-            # Save to temporary file for preview and download
+            elapsed = time.time() - start_total
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
             wavfile.write(temp_file.name, sr, waveform)
-            return (sr, waveform), temp_file.name, "Done."
+            
+            status_msg = f"Done in {elapsed:.2f}s | {total_chars} chars | Speed: {total_chars/elapsed:.1f} chars/s"
+            return (sr, waveform), temp_file.name, status_msg
 
         else: # Batch Files
             if not batch_files:
@@ -153,8 +160,23 @@ def process(
             
             temp_dir = tempfile.mkdtemp()
             output_files = []
+            total_files = len(batch_files)
             
-            for file_obj in batch_files:
+            progress(0, desc=f"Initializing {total_files} files...")
+            
+            cached_vc_prompt = None
+            if mode == "clone" and ref_audio:
+                if not ref_text:
+                    return None, None, "Reference Text is REQUIRED for Voice Clone (ASR disabled for speed)."
+                
+                progress(0.05, desc="Analyzing reference audio...")
+                with torch.inference_mode():
+                    cached_vc_prompt = model.create_voice_clone_prompt(
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
+                    )
+
+            for i, file_obj in enumerate(batch_files):
                 file_path = file_obj.name
                 base_name = os.path.splitext(os.path.basename(file_path))[0]
                 
@@ -164,27 +186,55 @@ def process(
                 if not content:
                     continue
                 
-                sr, waveform = generate_audio(
-                    content, language, num_step, guidance_scale, denoise, speed, 
-                    duration, preprocess_prompt, postprocess_output, mode, ref_audio, ref_text, instruct
+                total_chars += len(content)
+                progress((i / total_files), desc=f"Processing {i+1}/{total_files}: {base_name}")
+                
+                gen_config = OmniVoiceGenerationConfig(
+                    num_step=int(num_step),
+                    guidance_scale=float(guidance_scale),
+                    denoise=bool(denoise),
+                    preprocess_prompt=bool(preprocess_prompt),
+                    postprocess_output=bool(postprocess_output),
                 )
+                
+                kw = {
+                    "text": content,
+                    "language": LANG_MAP.get(language),
+                    "generation_config": gen_config,
+                    "speed": float(speed) if speed != 1.0 else None,
+                    "duration": float(duration) if duration and duration > 0 else None,
+                    "instruct": instruct
+                }
+                if mode == "clone":
+                    kw["voice_clone_prompt"] = cached_vc_prompt
+                
+                with torch.inference_mode():
+                    audio = model.generate(**kw)
+                
+                sr = model.sampling_rate
+                waveform = (audio[0] * 32767).astype(np.int16)
                 
                 out_path = os.path.join(temp_dir, f"{base_name}.wav")
                 wavfile.write(out_path, sr, waveform)
                 output_files.append(out_path)
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
+            progress(1.0, desc="Packaging results...")
             if not output_files:
                 return None, None, "No valid content found in files."
             
-            # Create ZIP
-            zip_name = "generated_audios.zip"
+            elapsed = time.time() - start_total
+            zip_name = f"batch_{int(time.time())}.zip"
             zip_path = os.path.join(tempfile.gettempdir(), zip_name)
             with zipfile.ZipFile(zip_path, 'w') as zipf:
                 for f in output_files:
                     zipf.write(f, os.path.basename(f))
             
             shutil.rmtree(temp_dir)
-            return None, zip_path, f"Processed {len(output_files)} files. Download ZIP below."
+            status_msg = f"Finished {len(output_files)} files | {total_chars} chars | Total time: {elapsed:.2f}s | Avg Speed: {total_chars/elapsed:.1f} chars/s"
+            return None, zip_path, status_msg
 
     except Exception as e:
         logging.error(f"Error during generation: {e}")
@@ -222,7 +272,9 @@ def build_app():
                             vc_pp = gr.Checkbox(label="Preprocess Prompt", value=True)
                             vc_po = gr.Checkbox(label="Postprocess Output", value=True)
                         
-                        vc_btn = gr.Button("Generate", variant="primary")
+                        with gr.Row():
+                            vc_btn = gr.Button("Generate", variant="primary")
+                            vc_stop_btn = gr.Button("Stop", variant="stop", interactive=False)
                     
                     with gr.Column():
                         vc_audio_preview = gr.Audio(label="Audio Preview", type="numpy")
@@ -259,8 +311,10 @@ def build_app():
                             vd_pp = gr.Checkbox(label="Preprocess Prompt", value=True)
                             vd_po = gr.Checkbox(label="Postprocess Output", value=True)
                         
-                        vd_btn = gr.Button("Generate", variant="primary")
-
+                        with gr.Row():
+                            vd_btn = gr.Button("Generate", variant="primary")
+                            vd_stop_btn = gr.Button("Stop", variant="stop", interactive=False)
+                    
                     with gr.Column():
                         vd_audio_preview = gr.Audio(label="Audio Preview", type="numpy")
                         vd_file_output = gr.File(label="Download Output (WAV or ZIP)")
@@ -273,26 +327,55 @@ def build_app():
                     outputs=[vd_text, vd_files]
                 )
 
-        # Event Handlers
-        vc_btn.click(
-            fn=process,
-            inputs=[
-                vc_input_mode, vc_text, vc_files, vc_lang, vc_num_step, vc_guidance, 
-                vc_denoise, vc_speed, vc_duration, vc_pp, vc_po, gr.State("clone"), 
-                vc_ref_audio, vc_ref_text
-            ],
-            outputs=[vc_audio_preview, vc_file_output, vc_status]
-        )
+        # Helper to toggle buttons
+        def start_gen():
+            return gr.update(interactive=False), gr.update(interactive=True)
+        
+        def end_gen():
+            return gr.update(interactive=True), gr.update(interactive=False)
 
-        vd_btn.click(
-            fn=process,
-            inputs=[
-                vd_input_mode, vd_text, vd_files, vd_lang, vd_num_step, vd_guidance, 
-                vd_denoise, vd_speed, vd_duration, vd_pp, vd_po, gr.State("design"),
-                gr.State(None), gr.State(None) # ref_audio, ref_text
-            ] + vd_design_dropdowns,
-            outputs=[vd_audio_preview, vd_file_output, vd_status]
+        # Event Handlers
+        # Voice Clone Click
+        vc_inputs = [
+            vc_input_mode, vc_text, vc_files, vc_lang, 
+            vc_num_step, vc_guidance, vc_denoise, vc_speed, vc_duration, 
+            vc_pp, vc_po
+        ]
+        
+        vc_click_event = vc_btn.click(
+            fn=start_gen,
+            outputs=[vc_btn, vc_stop_btn]
+        ).then(
+            fn=lambda *args: process(*args[:11], "clone", *args[11:13], *([None]*len(_CATEGORIES))),
+            inputs=vc_inputs + [vc_ref_audio, vc_ref_text],
+            outputs=[vc_audio_preview, vc_file_output, vc_status]
+        ).then(
+            fn=end_gen,
+            outputs=[vc_btn, vc_stop_btn]
         )
+        
+        vc_stop_btn.click(fn=None, cancels=[vc_click_event]).then(fn=end_gen, outputs=[vc_btn, vc_stop_btn])
+
+        # Voice Design Click
+        vd_inputs = [
+            vd_input_mode, vd_text, vd_files, vd_lang, 
+            vd_num_step, vd_guidance, vd_denoise, vd_speed, vd_duration, 
+            vd_pp, vd_po
+        ]
+        
+        vd_click_event = vd_btn.click(
+            fn=start_gen,
+            outputs=[vd_btn, vd_stop_btn]
+        ).then(
+            fn=lambda *args: process(*args[:11], "design", None, None, *args[11:]),
+            inputs=vd_inputs + vd_design_dropdowns,
+            outputs=[vd_audio_preview, vd_file_output, vd_status]
+        ).then(
+            fn=end_gen,
+            outputs=[vd_btn, vd_stop_btn]
+        )
+        
+        vd_stop_btn.click(fn=None, cancels=[vd_click_event]).then(fn=end_gen, outputs=[vd_btn, vd_stop_btn])
 
     return app
 
