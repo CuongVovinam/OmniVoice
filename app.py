@@ -391,4 +391,4 @@ if __name__ == "__main__":
     load_model(args.model)
     app = build_app()
     theme = gr.themes.Soft(primary_hue="blue", secondary_hue="slate")
-    app.launch(server_name=args.host, server_port=args.port, theme=theme)
+    app.queue().launch(server_name=args.host, server_port=args.port, theme=theme)
